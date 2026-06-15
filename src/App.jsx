@@ -305,14 +305,16 @@ function MealBuilderModal({existing,onSave,onClose}) {
   );
 }
 
+// ── Field (module-level so it stays stable across re-renders) ──────────────────
+function Field({label,children}) {
+  return <div style={S.fg}><label style={S.lbl}>{label}</label>{children}</div>;
+}
+
 // ── Settings Panel ────────────────────────────────────────────────────────────
 function SettingsPanel({profile,onSave,onClose}) {
   const [p,setP]=useState({...profile});
   const set=(k,v)=>setP(prev=>({...prev,[k]:v}));
   const calc=calcProfile(p);
-  const Field=({label,children})=>(
-    <div style={S.fg}><label style={S.lbl}>{label}</label>{children}</div>
-  );
   return (
     <div style={S.modal} onClick={e=>e.target===e.currentTarget&&onClose()}>
       <div style={{...S.mBox,maxWidth:520}}>
