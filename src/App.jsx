@@ -3,7 +3,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 const USDA_API_KEY = "DOIVgIVffohDzG2bSgYzeTnScZmhb8gC7hfwDEx7";
 const USDA_BASE    = "https://api.nal.usda.gov/fdc/v1";
 const DB_NAME      = "FuelLogDB";
-const DB_VERSION   = 1;
+const DB_VERSION   = 2;
 
 // ── IndexedDB helpers ────────────────────────────────────────────────────────
 function openDB() {
@@ -11,9 +11,10 @@ function openDB() {
     const req = indexedDB.open(DB_NAME, DB_VERSION);
     req.onupgradeneeded = (e) => {
       const db = e.target.result;
-      if (!db.objectStoreNames.contains("log"))      db.createObjectStore("log",      { keyPath:"id" });
-      if (!db.objectStoreNames.contains("meals"))    db.createObjectStore("meals",    { keyPath:"id" });
-      if (!db.objectStoreNames.contains("settings")) db.createObjectStore("settings", { keyPath:"key" });
+      if (!db.objectStoreNames.contains("log"))        db.createObjectStore("log",        { keyPath:"id" });
+      if (!db.objectStoreNames.contains("meals"))      db.createObjectStore("meals",      { keyPath:"id" });
+      if (!db.objectStoreNames.contains("settings"))   db.createObjectStore("settings",   { keyPath:"key" });
+      if (!db.objectStoreNames.contains("customFoods")) db.createObjectStore("customFoods", { keyPath:"id" });
     };
     req.onsuccess = (e) => res(e.target.result);
     req.onerror   = (e) => rej(e.target.error);
@@ -99,6 +100,21 @@ function macrosOf(food, grams) {
     fat:     Math.round(getNutrient(food,1004)*f*10)/10,
     fiber:   Math.round(getNutrient(food,1079)*f*10)/10,
   };
+}
+// Unified macro calc: custom foods carry per-serving macros; USDA foods are per-100g.
+function computeMacros(food, portion, qty) {
+  if (food && food._custom) {
+    const m = food._perServing || {kcal:0,protein:0,carbs:0,fat:0,fiber:0};
+    return {
+      kcal:    Math.round((m.kcal||0)*qty),
+      protein: Math.round((m.protein||0)*qty*10)/10,
+      carbs:   Math.round((m.carbs||0)*qty*10)/10,
+      fat:     Math.round((m.fat||0)*qty*10)/10,
+      fiber:   Math.round((m.fiber||0)*qty*10)/10,
+    };
+  }
+  const grams = (portion?.grams||100)*qty;
+  return macrosOf(food, grams);
 }
 function sumMacros(items) {
   return items.reduce((a,e)=>({
@@ -187,45 +203,106 @@ function Ring({pct,size=104,stroke=9,color=C.accent}) {
 }
 
 // ── FoodSearch ───────────────────────────────────────────────────────────────
-function FoodSearch({onSelect,placeholder="Search foods…",compact=false}) {
+function FoodSearch({onSelect,placeholder="Search foods…",compact=false,customFoods=[],onAddManual}) {
   const [q,setQ]=useState("");
   const [res,setRes]=useState([]);
   const [busy,setBusy]=useState(false);
+  const [picking,setPicking]=useState(false);
   const [open,setOpen]=useState(false);
+  const [searched,setSearched]=useState(false);
   const ref=useRef(null);
+  const reqId=useRef(0);
+
   useEffect(()=>{
     const h=(e)=>{if(ref.current&&!ref.current.contains(e.target))setOpen(false);};
     document.addEventListener("mousedown",h);
     return()=>document.removeEventListener("mousedown",h);
   },[]);
+
+  // Custom foods that match the current query (shown first, instantly)
+  const customMatches = (()=>{
+    const v=q.trim().toLowerCase();
+    if(!v) return [];
+    return customFoods.filter(f=>f.name.toLowerCase().includes(v));
+  })();
+
   const search=useCallback(debounce(async(v)=>{
-    if(!v.trim()){setRes([]);setOpen(false);return;}
+    const mine=++reqId.current;
+    if(!v.trim()){setRes([]);setSearched(false);return;}
     setBusy(true);
     try{
-      const r=await fetch(`${USDA_BASE}/foods/search?query=${encodeURIComponent(v)}&pageSize=14&api_key=${USDA_API_KEY}`);
+      // dataType filter surfaces common generic foods + branded items and keeps
+      // the obscure survey/experimental entries from burying obvious matches.
+      const params = new URLSearchParams({
+        query: v,
+        pageSize: "30",
+        dataType: "Foundation,SR Legacy,Branded",
+        api_key: USDA_API_KEY,
+      });
+      const r=await fetch(`${USDA_BASE}/foods/search?${params.toString()}`);
       const d=await r.json();
-      setRes(d.foods||[]);setOpen(true);
-    }catch{}finally{setBusy(false);}
-  },380),[]);
+      if(mine!==reqId.current) return; // a newer keystroke superseded this one
+      setRes(d.foods||[]);
+      setSearched(true);
+    }catch{
+      if(mine===reqId.current){ setRes([]); setSearched(true); }
+    }finally{
+      if(mine===reqId.current) setBusy(false);
+    }
+  },350),[]);
+
+  const onChange=(e)=>{
+    const v=e.target.value;
+    setQ(v); setOpen(true); setSearched(false);
+    search(v);
+  };
+
   const pick=async(food)=>{
-    setOpen(false);setQ("");setRes([]);
+    // Custom food: no network needed
+    if(food._custom){
+      setOpen(false);setQ("");setRes([]);setSearched(false);
+      onSelect(food);
+      return;
+    }
+    setPicking(true);
     try{
       const r=await fetch(`${USDA_BASE}/food/${food.fdcId}?api_key=${USDA_API_KEY}`);
       const detail=await r.json();
       const portions=(detail.foodPortions||[]).map(p=>({label:`${p.amount??1} ${p.modifier||p.measureUnit?.name||"serving"} (${Math.round(p.gramWeight)}g)`,grams:p.gramWeight}));
       portions.unshift({label:"100 g",grams:100});
       onSelect({...detail,_portions:portions});
-    }catch{onSelect({...food,_portions:[{label:"100 g",grams:100}]});}
+    }catch{
+      onSelect({...food,_portions:[{label:"100 g",grams:100}]});
+    }finally{
+      setPicking(false);setOpen(false);setQ("");setRes([]);setSearched(false);
+    }
   };
+
+  const noResults = searched && !busy && res.length===0 && customMatches.length===0;
+
   return (
     <div ref={ref} style={{position:"relative"}}>
-      <input value={q} onChange={e=>{setQ(e.target.value);search(e.target.value);}}
-        onFocus={()=>res.length&&setOpen(true)}
+      <input value={q} onChange={onChange}
+        onFocus={()=>(res.length||customMatches.length||q)&&setOpen(true)}
         placeholder={placeholder}
         style={{...S.inp,width:"100%",fontSize:compact?13:14,padding:compact?"8px 11px":"11px 14px"}}/>
-      {open&&(
-        <div style={{position:"absolute",top:"calc(100% + 5px)",left:0,right:0,background:"#1a1e38",border:`1px solid ${C.border}`,borderRadius:10,zIndex:150,maxHeight:260,overflowY:"auto",boxShadow:"0 8px 28px rgba(0,0,0,0.6)"}}>
-          {busy&&<div style={{padding:"11px 14px",fontSize:13,color:C.muted}}>Searching…</div>}
+      {picking&&<div style={{fontSize:11,color:C.accent,marginTop:5}}>Loading serving sizes…</div>}
+      {open&&(res.length>0||customMatches.length>0||busy||noResults)&&(
+        <div style={{position:"absolute",top:"calc(100% + 5px)",left:0,right:0,background:"#1a1e38",border:`1px solid ${C.border}`,borderRadius:10,zIndex:150,maxHeight:300,overflowY:"auto",boxShadow:"0 8px 28px rgba(0,0,0,0.6)"}}>
+          {/* Custom matches first */}
+          {customMatches.map(f=>{
+            const m=f._perServing||{};
+            return (
+              <div key={"c"+f.id} onClick={()=>pick(f)}
+                style={{padding:"9px 14px",cursor:"pointer",borderBottom:`1px solid ${C.dim}`}}
+                onMouseEnter={e=>e.currentTarget.style.background="#252a45"}
+                onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
+                <div style={{fontSize:13,fontWeight:500}}>{f.name} <span style={{...S.badge(C.accent),marginLeft:4}}>Custom</span></div>
+                <div style={{fontSize:11,color:C.muted}}>{f.servingLabel} · {Math.round(m.kcal||0)} kcal</div>
+              </div>
+            );
+          })}
+          {busy&&<div style={{padding:"11px 14px",fontSize:13,color:C.muted}}>Searching USDA database…</div>}
           {res.map(f=>(
             <div key={f.fdcId} onClick={()=>pick(f)}
               style={{padding:"9px 14px",cursor:"pointer",borderBottom:`1px solid ${C.dim}`}}
@@ -235,6 +312,12 @@ function FoodSearch({onSelect,placeholder="Search foods…",compact=false}) {
               <div style={{fontSize:11,color:C.muted}}>{f.brandOwner?`${f.brandOwner} · `:""}{Math.round(getNutrient(f,1008))} kcal/100g</div>
             </div>
           ))}
+          {noResults&&(
+            <div style={{padding:"12px 14px",fontSize:13,color:C.muted}}>
+              No matches for "{q}". Try a simpler term{onAddManual?", or ":"."}
+              {onAddManual&&<span onClick={()=>{setOpen(false);onAddManual(q);}} style={{color:C.accent,cursor:"pointer",fontWeight:600}}>add it manually</span>}
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -251,18 +334,99 @@ function MacroRow({macros}) {
   );
 }
 
+// ── Custom Food Modal ─────────────────────────────────────────────────────────
+function NumField({label,value,setter,color}) {
+  return (
+    <div>
+      <label style={{...S.lbl,color}}>{label}</label>
+      <input type="number" min="0" step="0.1" value={value} onChange={e=>setter(e.target.value)}
+        style={{...S.inp,width:"100%"}} placeholder="0"/>
+    </div>
+  );
+}
+
+function CustomFoodModal({existing,initialName="",onSave,onClose}) {
+  const [name,setName]       = useState(existing?.name || initialName || "");
+  const [servingLabel,setSL] = useState(existing?.servingLabel || "1 serving");
+  const [kcal,setKcal]       = useState(existing?._perServing?.kcal ?? "");
+  const [protein,setProtein] = useState(existing?._perServing?.protein ?? "");
+  const [carbs,setCarbs]     = useState(existing?._perServing?.carbs ?? "");
+  const [fat,setFat]         = useState(existing?._perServing?.fat ?? "");
+  const [fiber,setFiber]     = useState(existing?._perServing?.fiber ?? "");
+
+  const num=(v)=>{const n=parseFloat(v);return isNaN(n)?0:n;};
+  const canSave = name.trim() && servingLabel.trim() && kcal!=="";
+
+  const save=()=>{
+    if(!canSave) return;
+    onSave({
+      id: existing?.id || "custom_"+Date.now(),
+      _custom: true,
+      name: name.trim(),
+      servingLabel: servingLabel.trim(),
+      _perServing: { kcal:num(kcal), protein:num(protein), carbs:num(carbs), fat:num(fat), fiber:num(fiber) },
+      createdAt: existing?.createdAt || Date.now(),
+    });
+  };
+
+  return (
+    <div style={S.modal} onClick={e=>e.target===e.currentTarget&&onClose()}>
+      <div style={{...S.mBox,maxWidth:460}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
+          <div style={{fontSize:15,fontWeight:800}}>{existing?"Edit Custom Food":"Add Custom Food"}</div>
+          <button onClick={onClose} style={{background:"none",border:"none",color:C.muted,fontSize:20,cursor:"pointer"}}>✕</button>
+        </div>
+
+        <div style={S.fg}>
+          <label style={S.lbl}>Food name</label>
+          <input value={name} onChange={e=>setName(e.target.value)} style={{...S.inp,width:"100%"}} placeholder="e.g. Mom's Protein Smoothie"/>
+        </div>
+        <div style={S.fg}>
+          <label style={S.lbl}>Serving description</label>
+          <input value={servingLabel} onChange={e=>setSL(e.target.value)} style={{...S.inp,width:"100%"}} placeholder="e.g. 1 bottle (500ml), 1 bar, 2 scoops"/>
+          <div style={{fontSize:11,color:C.muted,marginTop:4}}>Enter the macros below <strong>per one of this serving</strong>. You can log multiples later with the quantity field.</div>
+        </div>
+
+        <div style={{...S.sec,marginBottom:8}}>Macros Per Serving</div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+          <NumField label="Calories (kcal)" value={kcal} setter={setKcal} color={C.accent}/>
+          <NumField label="Protein (g)" value={protein} setter={setProtein} color={C.blue}/>
+          <NumField label="Carbs (g)" value={carbs} setter={setCarbs} color={C.yellow}/>
+          <NumField label="Fat (g)" value={fat} setter={setFat} color={C.pink}/>
+          <NumField label="Fiber (g)" value={fiber} setter={setFiber} color={C.green}/>
+        </div>
+
+        <div style={{display:"flex",gap:8,marginTop:18}}>
+          <button onClick={save} style={{...S.btn(canSave?C.accent:C.dim),flex:1,opacity:canSave?1:0.5}}>
+            {existing?"Save Changes":"Save Food"}
+          </button>
+          <button onClick={onClose} style={S.ghost}>Cancel</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── Meal Builder Modal ────────────────────────────────────────────────────────
-function MealBuilderModal({existing,onSave,onClose}) {
+function MealBuilderModal({existing,onSave,onClose,customFoods=[]}) {
   const [name,setName]=useState(existing?.name||"");
   const [items,setItems]=useState(existing?.items||[]);
   const [pending,setPending]=useState(null);
   const [pSIdx,setPSIdx]=useState(0);
   const [pQty,setPQty]=useState(1);
+  const pendingPortions = pending
+    ? (pending._custom ? [{label:pending.servingLabel||"1 serving",grams:null}] : (pending._portions||[{label:"100 g",grams:100}]))
+    : [];
   const addPending=()=>{
     if(!pending)return;
-    const portions=pending._portions||[{label:"100 g",grams:100}];
-    const grams=(portions[pSIdx]?.grams||100)*pQty;
-    setItems(prev=>[...prev,{id:Date.now(),name:pending.description,serving:portions[pSIdx]?.label||"100g",grams,qty:pQty,...macrosOf(pending,grams)}]);
+    const m=computeMacros(pending,pendingPortions[pSIdx],pQty);
+    setItems(prev=>[...prev,{
+      id:Date.now(),
+      name: pending._custom?pending.name:pending.description,
+      serving:pendingPortions[pSIdx]?.label||"serving",
+      grams: pending._custom?null:(pendingPortions[pSIdx]?.grams||100)*pQty,
+      qty:pQty, ...m,
+    }]);
     setPending(null);setPSIdx(0);setPQty(1);
   };
   const totals=sumMacros(items);
@@ -277,19 +441,19 @@ function MealBuilderModal({existing,onSave,onClose}) {
         <input value={name} onChange={e=>setName(e.target.value)} placeholder="Meal name (e.g. Post-Climb Protein Bowl)"
           style={{...S.inp,width:"100%",marginBottom:12,fontSize:14}}/>
         <div style={{...S.sec,marginBottom:8}}>Add Ingredients</div>
-        <FoodSearch onSelect={f=>{setPending(f);setPSIdx(0);setPQty(1);}} placeholder="Search ingredient…" compact/>
+        <FoodSearch onSelect={f=>{setPending(f);setPSIdx(0);setPQty(1);}} placeholder="Search ingredient…" compact customFoods={customFoods}/>
         {pending&&(
           <div style={{background:C.bg,borderRadius:10,padding:"11px 12px",marginTop:10,border:`1px solid ${C.border}`}}>
-            <div style={{fontSize:13,fontWeight:600,marginBottom:7}}>{pending.description}</div>
+            <div style={{fontSize:13,fontWeight:600,marginBottom:7}}>{pending._custom?pending.name:pending.description}</div>
             <div style={{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}}>
               <select value={pSIdx} onChange={e=>setPSIdx(Number(e.target.value))} style={{...S.inp,flex:3,minWidth:110}}>
-                {(pending._portions||[{label:"100 g",grams:100}]).map((s,i)=><option key={i} value={i}>{s.label}</option>)}
+                {pendingPortions.map((s,i)=><option key={i} value={i}>{s.label}</option>)}
               </select>
               <input type="number" min="0.25" step="0.25" value={pQty} onChange={e=>setPQty(Math.max(0.25,parseFloat(e.target.value)||1))} style={{...S.inp,width:66}}/>
               <button onClick={addPending} style={S.btn()}>Add</button>
               <button onClick={()=>setPending(null)} style={S.ghost}>Cancel</button>
             </div>
-            <MacroRow macros={macrosOf(pending,(pending._portions?.[pSIdx]?.grams||100)*pQty)}/>
+            <MacroRow macros={computeMacros(pending,pendingPortions[pSIdx],pQty)}/>
           </div>
         )}
         {items.length>0&&(
@@ -452,11 +616,13 @@ export default function FuelLog() {
   const [profile,setProfile]     = useState(DEFAULT_PROFILE);
   const [logMap,setLogMap]       = useState({});    // {date: [entries]}
   const [savedMeals,setSavedMeals] = useState([]);
+  const [customFoods,setCustomFoods] = useState([]);
   const [dbReady,setDbReady]     = useState(false);
   const [showSettings,setShowSettings] = useState(false);
   const [showBuilder,setShowBuilder]   = useState(false);
   const [editMeal,setEditMeal]         = useState(null);
   const [quickLog,setQuickLog]         = useState(null);
+  const [customModal,setCustomModal]   = useState(null); // {existing, initialName} | null
   const [syncStatus,setSyncStatus]     = useState(null); // "syncing"|"ok"|"fail"
   const [resync,setResync]             = useState({busy:false,msg:null,kind:null});
 
@@ -470,8 +636,8 @@ export default function FuelLog() {
 
   // ── Load from IndexedDB ──
   const reloadFromDB = async () => {
-    const [logRows, mealRows, settingRows] = await Promise.all([
-      dbGetAll("log"), dbGetAll("meals"), dbGetAll("settings"),
+    const [logRows, mealRows, settingRows, customRows] = await Promise.all([
+      dbGetAll("log"), dbGetAll("meals"), dbGetAll("settings"), dbGetAll("customFoods"),
     ]);
     const map={};
     for(const row of logRows){
@@ -480,6 +646,7 @@ export default function FuelLog() {
     }
     setLogMap(map);
     setSavedMeals(mealRows);
+    setCustomFoods(customRows||[]);
     const prof = settingRows.find(s=>s.key==="profile");
     if(prof) setProfile({...DEFAULT_PROFILE,...prof.value});
     return { logRows, mealRows };
@@ -502,21 +669,25 @@ export default function FuelLog() {
 
   // ── Add single food entry ──
   const handleFoodSelect = (food) => {
-    const portions = food._portions||[{label:"100 g",grams:100}];
+    const portions = food._custom
+      ? [{label:food.servingLabel||"1 serving",grams:null}]
+      : (food._portions||[{label:"100 g",grams:100}]);
     setServings(portions); setSIdx(0); setQty(1); setSelFood(food);
   };
 
   const preview = (()=>{
     if(!selFood||!servings.length) return null;
-    const grams=(servings[sIdx]?.grams||100)*qty;
-    return{...macrosOf(selFood,grams),grams:Math.round(grams),serving:servings[sIdx]?.label||"100g"};
+    const m = computeMacros(selFood, servings[sIdx], qty);
+    const grams = selFood._custom ? null : Math.round((servings[sIdx]?.grams||100)*qty);
+    return {...m, grams, serving:servings[sIdx]?.label||"serving"};
   })();
 
   const addEntry = async() => {
     if(!selFood||!preview) return;
     const entry={
       id:Date.now(), date:todayKey(), meal:mealSlot,
-      name:selFood.description, serving:preview.serving, qty,
+      name: selFood._custom ? selFood.name : selFood.description,
+      serving:preview.serving, qty,
       kcal:preview.kcal, protein:preview.protein, carbs:preview.carbs, fat:preview.fat, fiber:preview.fiber,
     };
     await dbPut("log",entry);
@@ -552,6 +723,17 @@ export default function FuelLog() {
   const deleteMeal = async(id) => {
     await dbDelete("meals",id);
     setSavedMeals(prev=>prev.filter(m=>m.id!==id));
+  };
+
+  // ── Custom Foods CRUD ──
+  const saveCustomFood = async(food) => {
+    await dbPut("customFoods",food);
+    setCustomFoods(prev=>{const idx=prev.findIndex(f=>f.id===food.id);return idx>=0?prev.map((f,i)=>i===idx?food:f):[...prev,food];});
+    setCustomModal(null);
+  };
+  const deleteCustomFood = async(id) => {
+    await dbDelete("customFoods",id);
+    setCustomFoods(prev=>prev.filter(f=>f.id!==id));
   };
 
   // ── Google Sheets sync ──
@@ -698,10 +880,12 @@ export default function FuelLog() {
           <div style={S.sec}>Add Food</div>
           <div style={{display:"flex",gap:6,alignItems:"center"}}>
             {syncStatus&&<span style={{fontSize:11,color:syncStatus==="ok"?C.green:syncStatus==="fail"?C.red:C.yellow}}>{syncStatus==="syncing"?"↑ syncing…":syncStatus==="ok"?"✓ synced":"⚠ sync failed"}</span>}
+            <button onClick={()=>setCustomModal({})} style={{...S.ghost,fontSize:11}}>＋ Custom</button>
             <button onClick={()=>setTab("meals")} style={{...S.ghost,fontSize:11}}>📋 My Meals</button>
           </div>
         </div>
-        <FoodSearch onSelect={handleFoodSelect} placeholder="Search any food, brand, or ingredient…"/>
+        <FoodSearch onSelect={handleFoodSelect} placeholder="Search any food, brand, or ingredient…"
+          customFoods={customFoods} onAddManual={(name)=>setCustomModal({initialName:name})}/>
         {selFood&&servings.length>0&&(
           <div style={{marginTop:10}}>
             <div style={{...S.row,gap:8}}>
@@ -714,6 +898,7 @@ export default function FuelLog() {
               </select>
               <button onClick={addEntry} style={S.btn()}>+ Add</button>
             </div>
+            <div style={{fontSize:12,color:C.text,marginTop:8,fontWeight:600}}>{selFood._custom?selFood.name:selFood.description}</div>
             {preview&&<MacroRow macros={preview}/>}
           </div>
         )}
@@ -828,6 +1013,32 @@ export default function FuelLog() {
           );
         })
       )}
+
+      {/* Custom Foods */}
+      <div style={{...S.card,background:`linear-gradient(135deg,${C.card},#1a1628)`}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <div><div style={{fontSize:16,fontWeight:800,marginBottom:3}}>Custom Foods</div><div style={{fontSize:13,color:C.muted}}>Foods you entered by hand. They show up in search with a "Custom" tag.</div></div>
+          <button onClick={()=>setCustomModal({})} style={{...S.btn(),whiteSpace:"nowrap",marginLeft:10}}>＋ Add Food</button>
+        </div>
+      </div>
+      {customFoods.length>0 && customFoods.map(f=>{
+        const m=f._perServing||{};
+        return (
+          <div key={f.id} style={S.card}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+              <div>
+                <div style={{fontSize:15,fontWeight:700}}>{f.name}</div>
+                <div style={{fontSize:12,color:C.muted,marginTop:2}}>per {f.servingLabel}</div>
+              </div>
+              <div style={{display:"flex",gap:6}}>
+                <button onClick={()=>setCustomModal({existing:f})} style={S.ghost}>Edit</button>
+                <button onClick={()=>deleteCustomFood(f.id)} style={{...S.ghost,color:C.red,borderColor:C.red+"44"}}>Delete</button>
+              </div>
+            </div>
+            <MacroRow macros={{kcal:Math.round(m.kcal||0),protein:m.protein||0,carbs:m.carbs||0,fat:m.fat||0,fiber:m.fiber||0}}/>
+          </div>
+        );
+      })}
     </>
   );
 
@@ -1007,7 +1218,8 @@ export default function FuelLog() {
       </div>
 
       {showSettings&&<SettingsPanel profile={profile} onSave={saveProfile} onClose={()=>setShowSettings(false)}/>}
-      {showBuilder&&<MealBuilderModal existing={editMeal} onSave={saveMeal} onClose={()=>{setShowBuilder(false);setEditMeal(null);}}/>}
+      {showBuilder&&<MealBuilderModal existing={editMeal} customFoods={customFoods} onSave={saveMeal} onClose={()=>{setShowBuilder(false);setEditMeal(null);}}/>}
+      {customModal&&<CustomFoodModal existing={customModal.existing} initialName={customModal.initialName||""} onSave={saveCustomFood} onClose={()=>setCustomModal(null)}/>}
       {quickLog&&(
         <div style={S.modal} onClick={e=>e.target===e.currentTarget&&setQuickLog(null)}>
           <div style={{...S.mBox,maxWidth:380}}>
