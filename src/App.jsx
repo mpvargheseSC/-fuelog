@@ -59,6 +59,27 @@ async function syncToSheets(webhookUrl, entry) {
   } catch (e) { console.warn("Sheets sync failed:", e); }
 }
 
+// Read rows back from the sheet via JSONP (bypasses CORS — a plain GET fetch to
+// Apps Script is blocked by the browser, but a <script> tag is not).
+function readFromSheets(webhookUrl, timeoutMs = 15000) {
+  return new Promise((resolve, reject) => {
+    if (!webhookUrl) { reject(new Error("No Sheets URL set")); return; }
+    const cb = "fuelog_cb_" + Date.now() + "_" + Math.floor(Math.random()*1e6);
+    const script = document.createElement("script");
+    const timer = setTimeout(() => { cleanup(); reject(new Error("Sheet read timed out")); }, timeoutMs);
+    function cleanup() {
+      clearTimeout(timer);
+      try { delete window[cb]; } catch {}
+      if (script.parentNode) script.parentNode.removeChild(script);
+    }
+    window[cb] = (data) => { cleanup(); resolve(data); };
+    script.onerror = () => { cleanup(); reject(new Error("Sheet read failed")); };
+    const sep = webhookUrl.indexOf("?") >= 0 ? "&" : "?";
+    script.src = `${webhookUrl}${sep}action=read&callback=${cb}`;
+    document.body.appendChild(script);
+  });
+}
+
 // ── Pure helpers ─────────────────────────────────────────────────────────────
 const todayKey  = () => new Date().toISOString().slice(0,10);
 const isWeekend = (d) => { const w = new Date(d+"T12:00:00").getDay(); return w===0||w===6; };
@@ -437,6 +458,7 @@ export default function FuelLog() {
   const [editMeal,setEditMeal]         = useState(null);
   const [quickLog,setQuickLog]         = useState(null);
   const [syncStatus,setSyncStatus]     = useState(null); // "syncing"|"ok"|"fail"
+  const [resync,setResync]             = useState({busy:false,msg:null,kind:null});
 
   // food add state
   const [selFood,setSelFood]   = useState(null);
@@ -446,28 +468,27 @@ export default function FuelLog() {
   const [mealSlot,setMealSlot] = useState("Lunch");
   const [qlSlot,setQlSlot]     = useState("Lunch");
 
-  // ── Load from IndexedDB on mount ──
+  // ── Load from IndexedDB ──
+  const reloadFromDB = async () => {
+    const [logRows, mealRows, settingRows] = await Promise.all([
+      dbGetAll("log"), dbGetAll("meals"), dbGetAll("settings"),
+    ]);
+    const map={};
+    for(const row of logRows){
+      if(!map[row.date]) map[row.date]=[];
+      map[row.date].push(row);
+    }
+    setLogMap(map);
+    setSavedMeals(mealRows);
+    const prof = settingRows.find(s=>s.key==="profile");
+    if(prof) setProfile({...DEFAULT_PROFILE,...prof.value});
+    return { logRows, mealRows };
+  };
+
   useEffect(()=>{
     (async()=>{
-      try {
-        const [logRows, mealRows, settingRows] = await Promise.all([
-          dbGetAll("log"), dbGetAll("meals"), dbGetAll("settings"),
-        ]);
-        // Rebuild logMap
-        const map={};
-        for(const row of logRows){
-          if(!map[row.date]) map[row.date]=[];
-          map[row.date].push(row);
-        }
-        setLogMap(map);
-        setSavedMeals(mealRows);
-        const prof = settingRows.find(s=>s.key==="profile");
-        if(prof) setProfile({...DEFAULT_PROFILE,...prof.value});
-        setDbReady(true);
-      } catch(e) {
-        console.error("DB load error",e);
-        setDbReady(true);
-      }
+      try { await reloadFromDB(); setDbReady(true); }
+      catch(e) { console.error("DB load error",e); setDbReady(true); }
     })();
   },[]);
 
@@ -541,6 +562,65 @@ export default function FuelLog() {
       await syncToSheets(profile.sheetsUrl,entry);
       setSyncStatus("ok"); setTimeout(()=>setSyncStatus(null),2500);
     }catch{setSyncStatus("fail"); setTimeout(()=>setSyncStatus(null),3000);}
+  };
+
+  // ── Full bidirectional resync ──
+  // 1. Pulls every row from the sheet and adds any the phone is missing.
+  // 2. Uploads every local entry the sheet is missing.
+  // Matches on Entry ID first, then a date+meal+food+kcal+qty fallback for
+  // legacy rows, so neither direction creates duplicates.
+  const compositeKey = (e) => `${e.date}|${e.meal||""}|${(e.name||"").trim().toLowerCase()}|${e.kcal}|${e.qty}`;
+
+  const fullResync = async () => {
+    if(!profile.sheetsUrl){ setResync({busy:false,msg:"Connect Google Sheets in Settings first.",kind:"fail"}); return; }
+    setResync({busy:true,msg:"Resyncing…",kind:"info"});
+    try {
+      // Snapshot current local entries before we change anything
+      const localEntries = Object.values(logMap).flat();
+      const localIds  = new Set(localEntries.map(e=>String(e.id)));
+      const localComp = new Set(localEntries.map(compositeKey));
+
+      // 1. Read the sheet
+      const res = await readFromSheets(profile.sheetsUrl);
+      const sheetEntries = (res && res.entries) || [];
+
+      const sheetIds  = new Set(sheetEntries.map(e=>String(e.id)).filter(Boolean));
+      const sheetComp = new Set();
+
+      // 2. Sheet → local: add rows the phone doesn't have
+      let added = 0;
+      for(const se of sheetEntries){
+        const sid = String(se.id||"");
+        const norm = {
+          id: (sid && !isNaN(Number(sid))) ? Number(sid) : Date.now()+Math.random(),
+          date: se.date, meal: se.meal||"Snack",
+          name: se.name||"", serving: se.serving||"", qty: Number(se.qty)||1,
+          kcal: Number(se.kcal)||0, protein: Number(se.protein)||0,
+          carbs: Number(se.carbs)||0, fat: Number(se.fat)||0, fiber: Number(se.fiber)||0,
+        };
+        sheetComp.add(compositeKey(norm));
+        if(!norm.date) continue;
+        const known = (sid && localIds.has(sid)) || localComp.has(compositeKey(norm));
+        if(!known){ await dbPut("log",norm); added++; }
+      }
+
+      // 3. Local → sheet: upload entries the sheet doesn't have
+      let uploaded = 0;
+      for(const le of localEntries){
+        const known = sheetIds.has(String(le.id)) || sheetComp.has(compositeKey(le));
+        if(!known){ await syncToSheets(profile.sheetsUrl, le); uploaded++; }
+      }
+
+      // 4. Reload local from DB so the UI reflects pulled rows
+      await reloadFromDB();
+
+      setResync({busy:false,kind:"ok",
+        msg:`Resync complete — pulled ${added} from sheet, pushed ${uploaded} up.`});
+      setTimeout(()=>setResync({busy:false,msg:null,kind:null}),5000);
+    } catch(err) {
+      setResync({busy:false,kind:"fail",msg:`Resync failed: ${err.message}. Make sure you re-deployed the Apps Script (v2).`});
+      setTimeout(()=>setResync({busy:false,msg:null,kind:null}),6000);
+    }
   };
 
   // ── Derived ──
@@ -814,11 +894,31 @@ export default function FuelLog() {
   // ── RENDER HISTORY ────────────────────────────────────────────────────────
   const renderHistory = () => (
     <>
-      <div style={{...S.card,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-        <div><div style={S.sec}>Past 14 Days</div></div>
-        <button onClick={()=>exportCSV(allEntries)} style={{...S.btn(C.green,"#0d0f18"),fontSize:12}}>⬇ Export CSV</button>
+      <div style={{...S.card}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8}}>
+          <div style={S.sec}>Data & Sync</div>
+          <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+            <button onClick={fullResync} disabled={resync.busy}
+              style={{...S.btn(resync.busy?C.dim:C.accent),fontSize:12,opacity:resync.busy?0.6:1}}>
+              {resync.busy?"⟳ Resyncing…":"⟳ Full Resync"}
+            </button>
+            <button onClick={()=>exportCSV(allEntries)} style={{...S.btn(C.green,"#0d0f18"),fontSize:12}}>⬇ Export CSV</button>
+          </div>
+        </div>
+        {resync.msg&&(
+          <div style={{marginTop:10,fontSize:12,padding:"8px 12px",borderRadius:8,
+            background:resync.kind==="ok"?C.green+"15":resync.kind==="fail"?C.red+"15":C.accent+"15",
+            color:resync.kind==="ok"?C.green:resync.kind==="fail"?C.red:C.accent,
+            border:`1px solid ${(resync.kind==="ok"?C.green:resync.kind==="fail"?C.red:C.accent)}33`}}>
+            {resync.msg}
+          </div>
+        )}
+        <div style={{marginTop:10,fontSize:11,color:C.muted,lineHeight:1.55}}>
+          Full Resync pulls every row from your Google Sheet into this phone and pushes up any local entries the sheet is missing — fixing gaps from offline logging or a dropped connection. Your local data is always the source of truth; nothing is deleted.
+        </div>
       </div>
       <div style={S.card}>
+        <div style={S.sec}>Past 14 Days</div>
         {pastDays.length===0?<div style={{fontSize:13,color:C.dim,textAlign:"center",padding:"14px 0"}}>No history yet.</div>:(
           pastDays.map(day=>{
             const entries=logMap[day]||[],dayKcal=entries.reduce((s,e)=>s+e.kcal,0),dayGoal=goalFor(day,profile),dayProt=entries.reduce((s,e)=>s+e.protein,0),over=dayKcal>dayGoal;
